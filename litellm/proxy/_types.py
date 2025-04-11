@@ -28,6 +28,7 @@ from litellm.types.utils import (
     ProviderField,
     StandardCallbackDynamicParams,
     StandardLoggingMCPToolCall,
+    StandardLoggingModelInformation,
     StandardLoggingPayloadErrorInformation,
     StandardLoggingPayloadStatus,
     StandardPassThroughResponseObject,
@@ -1625,6 +1626,7 @@ class LiteLLM_UserTable(LiteLLMPydanticObjectBase):
     model_max_budget: Optional[Dict] = {}
     model_spend: Optional[Dict] = {}
     user_email: Optional[str] = None
+    user_alias: Optional[str] = None
     models: list = []
     tpm_limit: Optional[int] = None
     rpm_limit: Optional[int] = None
@@ -1935,6 +1937,8 @@ class SpendLogsMetadata(TypedDict):
     proxy_server_request: Optional[str]
     batch_models: Optional[List[str]]
     error_information: Optional[StandardLoggingPayloadErrorInformation]
+    usage_object: Optional[dict]
+    model_map_information: Optional[StandardLoggingModelInformation]
 
 
 class SpendLogsPayload(TypedDict):
@@ -2686,10 +2690,6 @@ class PrismaCompatibleUpdateDBModel(TypedDict, total=False):
     model_info: str
     updated_at: str
     updated_by: str
-
-
-class SpecialEnums(enum.Enum):
-    LITELM_MANAGED_FILE_ID_PREFIX = "litellm_proxy/"
 
 
 class SpecialManagementEndpointEnums(enum.Enum):

@@ -33,8 +33,8 @@ from litellm.constants import (
     DEFAULT_MOCK_RESPONSE_PROMPT_TOKEN_COUNT,
 )
 from litellm.cost_calculator import (
+    RealtimeAPITokenUsageProcessor,
     _select_model_name_for_cost_calc,
-    handle_realtime_stream_cost_calculation,
 )
 from litellm.integrations.arize.arize import ArizeLogger
 from litellm.integrations.custom_guardrail import CustomGuardrail
@@ -56,6 +56,7 @@ from litellm.types.llms.openai import (
     Batch,
     FineTuningJob,
     HttpxBinaryResponseContent,
+    OpenAIFileObject,
     ResponseCompletedEvent,
     ResponsesAPIResponse,
 )
@@ -67,6 +68,7 @@ from litellm.types.utils import (
     ImageResponse,
     LiteLLMBatch,
     LiteLLMLoggingBaseClass,
+    LiteLLMRealtimeStreamLoggingObject,
     ModelResponse,
     ModelResponseStream,
     RawRequestTypedDict,
@@ -621,7 +623,6 @@ class Logging(LiteLLMLoggingBaseClass):
                     ] = RawRequestTypedDict(
                         error=str(e),
                     )
-                    traceback.print_exc()
                     _metadata[
                         "raw_request"
                     ] = "Unable to Log \
@@ -902,9 +903,12 @@ class Logging(LiteLLMLoggingBaseClass):
             FineTuningJob,
             ResponsesAPIResponse,
             ResponseCompletedEvent,
+            OpenAIFileObject,
+            LiteLLMRealtimeStreamLoggingObject,
         ],
         cache_hit: Optional[bool] = None,
         litellm_model_name: Optional[str] = None,
+        router_model_id: Optional[str] = None,
     ) -> Optional[float]:
         """
         Calculate response cost using result + logging object variables.
@@ -943,6 +947,7 @@ class Logging(LiteLLMLoggingBaseClass):
                 "custom_pricing": custom_pricing,
                 "prompt": prompt,
                 "standard_built_in_tools_params": self.standard_built_in_tools_params,
+                "router_model_id": router_model_id,
             }
         except Exception as e:  # error creating kwargs for cost calculation
             debug_info = StandardLoggingModelCostFailureDebugInformation(
@@ -1053,32 +1058,50 @@ class Logging(LiteLLMLoggingBaseClass):
             ## if model in model cost map - log the response cost
             ## else set cost to None
 
+            logging_result = result
+
             if self.call_type == CallTypes.arealtime.value and isinstance(result, list):
-                self.model_call_details[
-                    "response_cost"
-                ] = handle_realtime_stream_cost_calculation(
-                    result, self.custom_llm_provider, self.model
+                combined_usage_object = RealtimeAPITokenUsageProcessor.collect_and_combine_usage_from_realtime_stream_results(
+                    results=result
                 )
+                logging_result = (
+                    RealtimeAPITokenUsageProcessor.create_logging_realtime_object(
+                        usage=combined_usage_object,
+                        results=result,
+                    )
+                )
+
+                # self.model_call_details[
+                #     "response_cost"
+                # ] = handle_realtime_stream_cost_calculation(
+                #     results=result,
+                #     combined_usage_object=combined_usage_object,
+                #     custom_llm_provider=self.custom_llm_provider,
+                #     litellm_model_name=self.model,
+                # )
+                # self.model_call_details["combined_usage_object"] = combined_usage_object
             if (
                 standard_logging_object is None
                 and result is not None
                 and self.stream is not True
             ):
                 if (
-                    isinstance(result, ModelResponse)
-                    or isinstance(result, ModelResponseStream)
-                    or isinstance(result, EmbeddingResponse)
-                    or isinstance(result, ImageResponse)
-                    or isinstance(result, TranscriptionResponse)
-                    or isinstance(result, TextCompletionResponse)
-                    or isinstance(result, HttpxBinaryResponseContent)  # tts
-                    or isinstance(result, RerankResponse)
-                    or isinstance(result, FineTuningJob)
-                    or isinstance(result, LiteLLMBatch)
-                    or isinstance(result, ResponsesAPIResponse)
+                    isinstance(logging_result, ModelResponse)
+                    or isinstance(logging_result, ModelResponseStream)
+                    or isinstance(logging_result, EmbeddingResponse)
+                    or isinstance(logging_result, ImageResponse)
+                    or isinstance(logging_result, TranscriptionResponse)
+                    or isinstance(logging_result, TextCompletionResponse)
+                    or isinstance(logging_result, HttpxBinaryResponseContent)  # tts
+                    or isinstance(logging_result, RerankResponse)
+                    or isinstance(logging_result, FineTuningJob)
+                    or isinstance(logging_result, LiteLLMBatch)
+                    or isinstance(logging_result, ResponsesAPIResponse)
+                    or isinstance(logging_result, OpenAIFileObject)
+                    or isinstance(logging_result, LiteLLMRealtimeStreamLoggingObject)
                 ):
                     ## HIDDEN PARAMS ##
-                    hidden_params = getattr(result, "_hidden_params", {})
+                    hidden_params = getattr(logging_result, "_hidden_params", {})
                     if hidden_params:
                         # add to metadata for logging
                         if self.model_call_details.get("litellm_params") is not None:
@@ -1096,7 +1119,7 @@ class Logging(LiteLLMLoggingBaseClass):
                             self.model_call_details["litellm_params"]["metadata"][  # type: ignore
                                 "hidden_params"
                             ] = getattr(
-                                result, "_hidden_params", {}
+                                logging_result, "_hidden_params", {}
                             )
                     ## RESPONSE COST - Only calculate if not in hidden_params ##
                     if "response_cost" in hidden_params:
@@ -1106,14 +1129,14 @@ class Logging(LiteLLMLoggingBaseClass):
                     else:
                         self.model_call_details[
                             "response_cost"
-                        ] = self._response_cost_calculator(result=result)
+                        ] = self._response_cost_calculator(result=logging_result)
                     ## STANDARDIZED LOGGING PAYLOAD
 
                     self.model_call_details[
                         "standard_logging_object"
                     ] = get_standard_logging_object_payload(
                         kwargs=self.model_call_details,
-                        init_response_obj=result,
+                        init_response_obj=logging_result,
                         start_time=start_time,
                         end_time=end_time,
                         logging_obj=self,
@@ -3132,6 +3155,7 @@ class StandardLoggingPayloadSetup:
         prompt_integration: Optional[str] = None,
         applied_guardrails: Optional[List[str]] = None,
         mcp_tool_call_metadata: Optional[StandardLoggingMCPToolCall] = None,
+        usage_object: Optional[dict] = None,
     ) -> StandardLoggingMetadata:
         """
         Clean and filter the metadata dictionary to include only the specified keys in StandardLoggingMetadata.
@@ -3179,6 +3203,7 @@ class StandardLoggingPayloadSetup:
             prompt_management_metadata=prompt_management_metadata,
             applied_guardrails=applied_guardrails,
             mcp_tool_call_metadata=mcp_tool_call_metadata,
+            usage_object=usage_object,
         )
         if isinstance(metadata, dict):
             # Filter the metadata dictionary to include only the specified keys
@@ -3204,8 +3229,12 @@ class StandardLoggingPayloadSetup:
         return clean_metadata
 
     @staticmethod
-    def get_usage_from_response_obj(response_obj: Optional[dict]) -> Usage:
+    def get_usage_from_response_obj(
+        response_obj: Optional[dict], combined_usage_object: Optional[Usage] = None
+    ) -> Usage:
         ## BASE CASE ##
+        if combined_usage_object is not None:
+            return combined_usage_object
         if response_obj is None:
             return Usage(
                 prompt_tokens=0,
@@ -3334,6 +3363,7 @@ class StandardLoggingPayloadSetup:
             litellm_overhead_time_ms=None,
             batch_models=None,
             litellm_model_name=None,
+            usage_object=None,
         )
         if hidden_params is not None:
             for key in StandardLoggingHiddenParams.__annotations__.keys():
@@ -3450,6 +3480,7 @@ def get_standard_logging_object_payload(
                         litellm_overhead_time_ms=None,
                         batch_models=None,
                         litellm_model_name=None,
+                        usage_object=None,
                     )
                 )
 
@@ -3466,8 +3497,12 @@ def get_standard_logging_object_payload(
         call_type = kwargs.get("call_type")
         cache_hit = kwargs.get("cache_hit", False)
         usage = StandardLoggingPayloadSetup.get_usage_from_response_obj(
-            response_obj=response_obj
+            response_obj=response_obj,
+            combined_usage_object=cast(
+                Optional[Usage], kwargs.get("combined_usage_object")
+            ),
         )
+
         id = response_obj.get("id", kwargs.get("litellm_call_id"))
 
         _model_id = metadata.get("model_info", {}).get("id", "")
@@ -3506,6 +3541,7 @@ def get_standard_logging_object_payload(
             prompt_integration=kwargs.get("prompt_integration", None),
             applied_guardrails=kwargs.get("applied_guardrails", None),
             mcp_tool_call_metadata=kwargs.get("mcp_tool_call_metadata", None),
+            usage_object=usage.model_dump(),
         )
 
         _request_body = proxy_server_request.get("body", {})
@@ -3646,6 +3682,7 @@ def get_standard_logging_metadata(
         prompt_management_metadata=None,
         applied_guardrails=None,
         mcp_tool_call_metadata=None,
+        usage_object=None,
     )
     if isinstance(metadata, dict):
         # Filter the metadata dictionary to include only the specified keys
@@ -3740,6 +3777,7 @@ def create_dummy_standard_logging_payload() -> StandardLoggingPayload:
         litellm_overhead_time_ms=None,
         batch_models=None,
         litellm_model_name=None,
+        usage_object=None,
     )
 
     # Convert numeric values to appropriate types
