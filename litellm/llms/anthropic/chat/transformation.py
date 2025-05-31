@@ -6,6 +6,7 @@ import httpx
 
 import litellm
 from litellm.constants import (
+    ANTHROPIC_WEB_SEARCH_TOOL_MAX_USES,
     DEFAULT_ANTHROPIC_CHAT_MAX_TOKENS,
     DEFAULT_REASONING_EFFORT_HIGH_THINKING_BUDGET,
     DEFAULT_REASONING_EFFORT_LOW_THINKING_BUDGET,
@@ -17,7 +18,9 @@ from litellm.litellm_core_utils.prompt_templates.factory import anthropic_messag
 from litellm.llms.base_llm.base_utils import type_to_response_format_param
 from litellm.llms.base_llm.chat.transformation import BaseConfig, BaseLLMException
 from litellm.types.llms.anthropic import (
+    AllAnthropicMessageValues,
     AllAnthropicToolsValues,
+    AnthropicCodeExecutionTool,
     AnthropicComputerTool,
     AnthropicHostedTools,
     AnthropicInputSchema,
@@ -25,6 +28,8 @@ from litellm.types.llms.anthropic import (
     AnthropicMessagesToolChoice,
     AnthropicSystemMessageContent,
     AnthropicThinkingParam,
+    AnthropicWebSearchTool,
+    AnthropicWebSearchUserLocation,
 )
 from litellm.types.llms.openai import (
     REASONING_EFFORT,
@@ -36,15 +41,17 @@ from litellm.types.llms.openai import (
     ChatCompletionToolCallChunk,
     ChatCompletionToolCallFunctionChunk,
     ChatCompletionToolParam,
+    OpenAIWebSearchOptions,
 )
 from litellm.types.utils import CompletionTokensDetailsWrapper
 from litellm.types.utils import Message as LitellmMessage
-from litellm.types.utils import PromptTokensDetailsWrapper
+from litellm.types.utils import PromptTokensDetailsWrapper, ServerToolUse
 from litellm.utils import (
     ModelResponse,
     Usage,
     add_dummy_tool,
     has_tool_call_blocks,
+    supports_reasoning,
     token_counter,
 )
 
@@ -58,7 +65,7 @@ else:
     LoggingClass = Any
 
 
-ANTHROPIC_HOSTED_TOOLS = ["web_search", "bash", "text_editor"]
+ANTHROPIC_HOSTED_TOOLS = ["web_search", "bash", "text_editor", "code_execution"]
 
 
 class AnthropicConfig(AnthropicModelInfo, BaseConfig):
@@ -114,9 +121,13 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             "response_format",
             "user",
             "reasoning_effort",
+            "web_search_options",
         ]
 
-        if "claude-3-7-sonnet" in model:
+        if "claude-3-7-sonnet" in model or supports_reasoning(
+            model=model,
+            custom_llm_provider=self.custom_llm_provider,
+        ):
             params.append("thinking")
 
         return params
@@ -329,6 +340,37 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
 
         return _tool
 
+    def map_web_search_tool(
+        self,
+        value: OpenAIWebSearchOptions,
+    ) -> AnthropicWebSearchTool:
+        value_typed = cast(OpenAIWebSearchOptions, value)
+        hosted_web_search_tool = AnthropicWebSearchTool(
+            type="web_search_20250305",
+            name="web_search",
+        )
+        user_location = value_typed.get("user_location")
+        if user_location is not None:
+            anthropic_user_location = AnthropicWebSearchUserLocation(type="approximate")
+            anthropic_user_location_keys = (
+                AnthropicWebSearchUserLocation.__annotations__.keys()
+            )
+            user_location_approximate = user_location.get("approximate")
+            if user_location_approximate is not None:
+                for key, user_location_value in user_location_approximate.items():
+                    if key in anthropic_user_location_keys and key != "type":
+                        anthropic_user_location[key] = user_location_value  # type: ignore
+                hosted_web_search_tool["user_location"] = anthropic_user_location
+
+        ## MAP SEARCH CONTEXT SIZE
+        search_context_size = value_typed.get("search_context_size")
+        if search_context_size is not None:
+            hosted_web_search_tool["max_uses"] = ANTHROPIC_WEB_SEARCH_TOOL_MAX_USES[
+                search_context_size
+            ]
+
+        return hosted_web_search_tool
+
     def map_openai_params(
         self,
         non_default_params: dict,
@@ -392,11 +434,19 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                 optional_params["thinking"] = AnthropicConfig._map_reasoning_effort(
                     value
                 )
+            elif param == "web_search_options" and isinstance(value, dict):
+                hosted_web_search_tool = self.map_web_search_tool(
+                    cast(OpenAIWebSearchOptions, value)
+                )
+                self._add_tools_to_optional_params(
+                    optional_params=optional_params, tools=[hosted_web_search_tool]
+                )
 
         ## handle thinking tokens
         self.update_optional_params_with_thinking_tokens(
             non_default_params=non_default_params, optional_params=optional_params
         )
+
         return optional_params
 
     def _create_json_tool_call_for_response_format(
@@ -482,6 +532,40 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
 
         return anthropic_system_message_list
 
+    def add_code_execution_tool(
+        self,
+        messages: List[AllAnthropicMessageValues],
+        tools: List[Union[AllAnthropicToolsValues, Dict]],
+    ) -> List[Union[AllAnthropicToolsValues, Dict]]:
+        """if 'container_upload' in messages, add code_execution tool"""
+        add_code_execution_tool = False
+        for message in messages:
+            message_content = message.get("content", None)
+            if message_content and isinstance(message_content, list):
+                for content in message_content:
+                    content_type = content.get("type", None)
+                    if content_type == "container_upload":
+                        add_code_execution_tool = True
+                        break
+
+        if add_code_execution_tool:
+            ## check if code_execution tool is already in tools
+            for tool in tools:
+                tool_type = tool.get("type", None)
+                if (
+                    tool_type
+                    and isinstance(tool_type, str)
+                    and tool_type.startswith("code_execution")
+                ):
+                    return tools
+            tools.append(
+                AnthropicCodeExecutionTool(
+                    name="code_execution",
+                    type="code_execution_20250522",
+                )
+            )
+        return tools
+
     def transform_request(
         self,
         model: str,
@@ -530,6 +614,18 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                 status_code=400,
                 message="{}\nReceived Messages={}".format(str(e), messages),
             )  # don't use verbose_logger.exception, if exception is raised
+
+        ## Add code_execution tool if container_upload is in messages
+        _tools = (
+            cast(
+                Optional[List[Union[AllAnthropicToolsValues, Dict]]],
+                optional_params.get("tools"),
+            )
+            or []
+        )
+        tools = self.add_code_execution_tool(messages=anthropic_messages, tools=_tools)
+        if len(tools) > 1:
+            optional_params["tools"] = tools
 
         ## Load Config
         config = litellm.AnthropicConfig.get_config()
@@ -648,15 +744,20 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
         _usage = usage_object
         cache_creation_input_tokens: int = 0
         cache_read_input_tokens: int = 0
-
+        web_search_requests: Optional[int] = None
         if "cache_creation_input_tokens" in _usage:
             cache_creation_input_tokens = _usage["cache_creation_input_tokens"]
         if "cache_read_input_tokens" in _usage:
             cache_read_input_tokens = _usage["cache_read_input_tokens"]
             prompt_tokens += cache_read_input_tokens
+        if "server_tool_use" in _usage:
+            if "web_search_requests" in _usage["server_tool_use"]:
+                web_search_requests = cast(
+                    int, _usage["server_tool_use"]["web_search_requests"]
+                )
 
         prompt_tokens_details = PromptTokensDetailsWrapper(
-            cached_tokens=cache_read_input_tokens
+            cached_tokens=cache_read_input_tokens,
         )
         completion_token_details = (
             CompletionTokensDetailsWrapper(
@@ -668,6 +769,7 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             else None
         )
         total_tokens = prompt_tokens + completion_tokens
+
         usage = Usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -676,6 +778,9 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             cache_creation_input_tokens=cache_creation_input_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
             completion_tokens_details=completion_token_details,
+            server_tool_use=ServerToolUse(web_search_requests=web_search_requests)
+            if web_search_requests is not None
+            else None,
         )
         return usage
 
