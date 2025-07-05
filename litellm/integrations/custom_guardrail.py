@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Type, Union
 
 from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
@@ -9,6 +9,7 @@ from litellm.types.guardrails import (
     LitellmParams,
     PiiEntityType,
 )
+from litellm.types.proxy.guardrails.guardrail_hooks.base import GuardrailConfigModel
 from litellm.types.utils import StandardLoggingGuardrailInformation
 
 
@@ -51,6 +52,15 @@ class CustomGuardrail(CustomLogger):
             self._validate_event_hook(event_hook, supported_event_hooks)
         super().__init__(**kwargs)
 
+    @staticmethod
+    def get_config_model() -> Optional[Type["GuardrailConfigModel"]]:
+        """
+        Returns the config model for the guardrail
+
+        This is used to render the config model in the UI.
+        """
+        return None
+
     def _validate_event_hook(
         self,
         event_hook: Optional[Union[GuardrailEventHooks, List[GuardrailEventHooks]]],
@@ -92,10 +102,13 @@ class CustomGuardrail(CustomLogger):
         for _guardrail in requested_guardrails:
             if isinstance(_guardrail, dict):
                 if self.guardrail_name in _guardrail:
+
                     return True
             elif isinstance(_guardrail, str):
                 if self.guardrail_name == _guardrail:
+
                     return True
+
         return False
 
     def should_run_guardrail(self, data, event_type: GuardrailEventHooks) -> bool:

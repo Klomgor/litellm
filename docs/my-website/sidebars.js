@@ -256,6 +256,7 @@ const sidebars = {
         "embedding/supported_embedding",
         "anthropic_unified",
         "mcp",
+        "generateContent",
         {
           type: "category",
           label: "/images",
@@ -355,12 +356,12 @@ const sidebars = {
           ]
         },
         "providers/azure_ai",
-        "providers/aiml",
         {
           type: "category",
           label: "Vertex AI",
           items: [
             "providers/vertex",
+            "providers/vertex_partner",
             "providers/vertex_image",
           ]
         },
@@ -423,6 +424,7 @@ const sidebars = {
         "providers/llamafile",
         "providers/infinity",
         "providers/xinference",
+        "providers/aiml",
         "providers/cloudflare_workers",
         "providers/deepinfra",
         "providers/github",
